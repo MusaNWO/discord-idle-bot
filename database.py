@@ -39,6 +39,7 @@ class TimeTracker:
                     check_out_time TIMESTAMP,
                     total_minutes INTEGER,
                     idle_minutes INTEGER,
+                    offline_minutes INTEGER DEFAULT 0,
                     break_minutes INTEGER,
                     active_minutes INTEGER
                 )
@@ -54,6 +55,27 @@ class TimeTracker:
                     start_time TIMESTAMP,
                     end_time TIMESTAMP,
                     duration_minutes INTEGER
+                )
+            """)
+            
+            # Table for employee expected check-in times
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS employee_schedule (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    expected_checkin_time TEXT,
+                    expected_checkout_time TEXT,
+                    work_days TEXT
+                )
+            """)
+            
+            # Table for tracking sent reports
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS report_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    report_type TEXT,
+                    report_date DATE,
+                    sent_at TIMESTAMP
                 )
             """)
             
@@ -112,9 +134,24 @@ class TimeTracker:
                 # Calculate total shift time
                 total_minutes = int((now - check_in_dt).total_seconds() / 60)
                 
-                # Get idle and break time from previous status changes
+                # Get idle, offline, and break time from status logs
                 idle_minutes = 0
+                offline_minutes = 0
                 break_minutes = 0
+                
+                # Get status logs for this shift
+                async with db.execute("""
+                    SELECT status, COALESCE(SUM(duration_minutes), 0) 
+                    FROM status_logs 
+                    WHERE user_id = ? AND start_time >= ?
+                    GROUP BY status
+                """, (user_id, check_in)) as cursor2:
+                    async for row in cursor2:
+                        status, duration = row
+                        if status == 'idle':
+                            idle_minutes += duration
+                        elif status == 'offline':
+                            offline_minutes += duration
                 
                 # Calculate any ongoing break
                 if on_break and break_start:
@@ -126,21 +163,21 @@ class TimeTracker:
                 async with db.execute("""
                     SELECT COALESCE(SUM(duration_minutes), 0) FROM break_logs
                     WHERE user_id = ? AND break_start >= ?
-                """, (user_id, check_in)) as cursor2:
-                    result = await cursor2.fetchone()
+                """, (user_id, check_in)) as cursor3:
+                    result = await cursor3.fetchone()
                     if result:
                         break_minutes += result[0]
                 
-                # Calculate idle time (we'll track this separately)
-                # For now, active = total - break
-                active_minutes = total_minutes - break_minutes
+                # Calculate active time: total - idle - offline - break
+                active_minutes = total_minutes - idle_minutes - offline_minutes - break_minutes
+                active_minutes = max(0, active_minutes)  # Ensure non-negative
                 
                 # Save shift to history
                 await db.execute("""
                     INSERT INTO shift_history (user_id, username, check_in_time, check_out_time, 
-                                              total_minutes, idle_minutes, break_minutes, active_minutes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (user_id, username, check_in, now, total_minutes, idle_minutes, break_minutes, active_minutes))
+                                              total_minutes, idle_minutes, offline_minutes, break_minutes, active_minutes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (user_id, username, check_in, now, total_minutes, idle_minutes, offline_minutes, break_minutes, active_minutes))
                 
                 # Remove from active shifts
                 await db.execute("DELETE FROM active_shifts WHERE user_id = ?", (user_id,))
@@ -153,6 +190,7 @@ class TimeTracker:
                     "total_minutes": total_minutes,
                     "active_minutes": active_minutes,
                     "idle_minutes": idle_minutes,
+                    "offline_minutes": offline_minutes,
                     "break_minutes": break_minutes
                 }
     
@@ -216,20 +254,20 @@ class TimeTracker:
                 return duration
     
     async def update_status(self, user_id: int, new_status: str):
-        """Update user's Discord status (online/idle) during their shift"""
+        """Update user's Discord status (online/idle/offline) during their shift"""
         now = datetime.datetime.now(PKT)
         async with aiosqlite.connect(self.db_path) as db:
             # Check if user is checked in and not on break
             async with db.execute("""
-                SELECT current_status, status_start_time, on_break 
+                SELECT current_status, status_start_time, on_break, check_in_time
                 FROM active_shifts WHERE user_id = ?
             """, (user_id,)) as cursor:
                 row = await cursor.fetchone()
                 if not row:  # Not checked in
                     return
                 
-                # Unpack all three values from the query
-                old_status, status_start, on_break = row
+                # Unpack all values from the query
+                old_status, status_start, on_break, check_in = row
                 
                 # Skip if on break
                 if on_break == 1:
@@ -237,6 +275,24 @@ class TimeTracker:
                 
                 if old_status == new_status:
                     return  # No change
+                
+                # Log the previous status period
+                if status_start:
+                    try:
+                        status_start_dt = datetime.datetime.fromisoformat(status_start)
+                        if status_start_dt.tzinfo is None:
+                            status_start_dt = status_start_dt.replace(tzinfo=UTC).astimezone(PKT)
+                        
+                        duration_minutes = int((now - status_start_dt).total_seconds() / 60)
+                        
+                        # Only log if duration is significant (more than 1 minute)
+                        if duration_minutes > 1 and old_status in ['idle', 'offline']:
+                            await db.execute("""
+                                INSERT INTO status_logs (user_id, status, start_time, end_time, duration_minutes)
+                                VALUES (?, ?, ?, ?, ?)
+                            """, (user_id, old_status, status_start, now, duration_minutes))
+                    except Exception as e:
+                        print(f"Error logging status change: {e}")
                 
                 # Update status
                 await db.execute("""
@@ -281,6 +337,7 @@ class TimeTracker:
                     COALESCE(SUM(total_minutes), 0) as total_min,
                     COALESCE(SUM(active_minutes), 0) as active_min,
                     COALESCE(SUM(idle_minutes), 0) as idle_min,
+                    COALESCE(SUM(offline_minutes), 0) as offline_min,
                     COALESCE(SUM(break_minutes), 0) as break_min
                 FROM shift_history
                 WHERE user_id = ? AND check_in_time >= ?
@@ -292,7 +349,8 @@ class TimeTracker:
                     "total_hours": (row[1] or 0) / 60,
                     "active_hours": (row[2] or 0) / 60,
                     "idle_hours": (row[3] or 0) / 60,
-                    "break_hours": (row[4] or 0) / 60
+                    "offline_hours": (row[4] or 0) / 60,
+                    "break_hours": (row[5] or 0) / 60
                 }
     
     async def get_daily_stats(self, user_id: int, days: int = 7) -> List[Dict]:
@@ -309,6 +367,8 @@ class TimeTracker:
                     COUNT(*) as shifts,
                     COALESCE(SUM(total_minutes), 0) as total_min,
                     COALESCE(SUM(active_minutes), 0) as active_min,
+                    COALESCE(SUM(idle_minutes), 0) as idle_min,
+                    COALESCE(SUM(offline_minutes), 0) as offline_min,
                     COALESCE(SUM(break_minutes), 0) as break_min
                 FROM shift_history
                 WHERE user_id = ? AND check_in_time >= ?
@@ -316,12 +376,14 @@ class TimeTracker:
                 ORDER BY shift_date DESC
             """, (user_id, cutoff)) as cursor:
                 async for row in cursor:
-                    shift_date, shifts, total_min, active_min, break_min = row
+                    shift_date, shifts, total_min, active_min, idle_min, offline_min, break_min = row
                     daily_stats.append({
                         "date": shift_date,
                         "shifts": shifts,
                         "total_hours": total_min / 60,
                         "active_hours": active_min / 60,
+                        "idle_hours": idle_min / 60,
+                        "offline_hours": offline_min / 60,
                         "break_hours": break_min / 60
                     })
             
@@ -374,3 +436,155 @@ class TimeTracker:
                         print(f"Error processing shift row: {e}")
                         continue
             return shifts
+    
+    async def get_missing_checkins(self, expected_time: str = "09:00") -> List[Dict]:
+        """Get employees who haven't checked in by expected time"""
+        now = datetime.datetime.now(PKT)
+        today = now.date()
+        expected_dt = datetime.datetime.combine(today, datetime.time.fromisoformat(expected_time))
+        expected_dt = expected_dt.replace(tzinfo=PKT)
+        
+        # Only check if current time is past expected time
+        if now < expected_dt:
+            return []
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            missing = []
+            # Get all employees with schedules
+            async with db.execute("""
+                SELECT user_id, username, expected_checkin_time, work_days
+                FROM employee_schedule
+            """) as cursor:
+                async for row in cursor:
+                    user_id, username, expected, work_days = row
+                    # Check if today is a work day
+                    day_name = now.strftime('%A').lower()
+                    if work_days and day_name not in work_days.lower():
+                        continue
+                    
+                    # Check if user has checked in today
+                    async with db.execute("""
+                        SELECT user_id FROM active_shifts 
+                        WHERE user_id = ? AND DATE(check_in_time) = DATE(?)
+                    """, (user_id, now)) as check_cursor:
+                        if await check_cursor.fetchone():
+                            continue  # Already checked in
+                    
+                    missing.append({
+                        "user_id": user_id,
+                        "username": username,
+                        "expected_time": expected or expected_time
+                    })
+            return missing
+    
+    async def get_missing_checkouts(self) -> List[Dict]:
+        """Get employees who haven't checked out (still checked in from previous day)"""
+        now = datetime.datetime.now(PKT)
+        yesterday = now - datetime.timedelta(days=1)
+        
+        async with aiosqlite.connect(self.db_path) as db:
+            missing = []
+            # Get all active shifts that started before today
+            async with db.execute("""
+                SELECT user_id, username, check_in_time
+                FROM active_shifts
+                WHERE DATE(check_in_time) < DATE(?)
+            """, (now,)) as cursor:
+                async for row in cursor:
+                    user_id, username, check_in = row
+                    try:
+                        check_in_dt = datetime.datetime.fromisoformat(check_in)
+                        if check_in_dt.tzinfo is None:
+                            check_in_dt = check_in_dt.replace(tzinfo=UTC).astimezone(PKT)
+                        
+                        # If checked in more than 12 hours ago, likely forgot to checkout
+                        hours_ago = (now - check_in_dt).total_seconds() / 3600
+                        if hours_ago > 12:
+                            missing.append({
+                                "user_id": user_id,
+                                "username": username,
+                                "check_in_time": check_in_dt,
+                                "hours_ago": hours_ago
+                            })
+                    except Exception as e:
+                        print(f"Error processing missing checkout: {e}")
+            return missing
+    
+    async def set_employee_schedule(self, user_id: int, username: str, checkin_time: str, checkout_time: str, work_days: str = "monday,tuesday,wednesday,thursday,friday"):
+        """Set expected schedule for an employee"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT OR REPLACE INTO employee_schedule 
+                (user_id, username, expected_checkin_time, expected_checkout_time, work_days)
+                VALUES (?, ?, ?, ?, ?)
+            """, (user_id, username, checkin_time, checkout_time, work_days))
+            await db.commit()
+    
+    async def get_weekly_report_data(self, start_date: datetime.date, end_date: datetime.date) -> Dict:
+        """Get data for weekly report"""
+        async with aiosqlite.connect(self.db_path) as db:
+            # Get all shifts in date range
+            async with db.execute("""
+                SELECT 
+                    user_id,
+                    username,
+                    COUNT(*) as shifts,
+                    COALESCE(SUM(total_minutes), 0) as total_min,
+                    COALESCE(SUM(active_minutes), 0) as active_min,
+                    COALESCE(SUM(idle_minutes), 0) as idle_min,
+                    COALESCE(SUM(offline_minutes), 0) as offline_min,
+                    COALESCE(SUM(break_minutes), 0) as break_min
+                FROM shift_history
+                WHERE DATE(check_in_time) >= ? AND DATE(check_in_time) <= ?
+                GROUP BY user_id, username
+                ORDER BY active_min DESC
+            """, (start_date, end_date)) as cursor:
+                employees = []
+                async for row in cursor:
+                    user_id, username, shifts, total_min, active_min, idle_min, offline_min, break_min = row
+                    employees.append({
+                        "user_id": user_id,
+                        "username": username,
+                        "shifts": shifts,
+                        "total_hours": total_min / 60,
+                        "active_hours": active_min / 60,
+                        "idle_hours": idle_min / 60,
+                        "offline_hours": offline_min / 60,
+                        "break_hours": break_min / 60,
+                        "productivity_score": (active_min / total_min * 100) if total_min > 0 else 0
+                    })
+                
+                return {
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "employees": employees,
+                    "total_employees": len(employees)
+                }
+    
+    async def get_monthly_report_data(self, year: int, month: int) -> Dict:
+        """Get data for monthly report"""
+        start_date = datetime.date(year, month, 1)
+        if month == 12:
+            end_date = datetime.date(year + 1, 1, 1) - datetime.timedelta(days=1)
+        else:
+            end_date = datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)
+        
+        return await self.get_weekly_report_data(start_date, end_date)
+    
+    async def log_report_sent(self, report_type: str, report_date: datetime.date):
+        """Log that a report was sent"""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT INTO report_logs (report_type, report_date, sent_at)
+                VALUES (?, ?, ?)
+            """, (report_type, report_date, datetime.datetime.now(PKT)))
+            await db.commit()
+    
+    async def was_report_sent(self, report_type: str, report_date: datetime.date) -> bool:
+        """Check if a report was already sent"""
+        async with aiosqlite.connect(self.db_path) as db:
+            async with db.execute("""
+                SELECT id FROM report_logs 
+                WHERE report_type = ? AND report_date = ?
+            """, (report_type, report_date)) as cursor:
+                return await cursor.fetchone() is not None

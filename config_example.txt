@@ -1,5 +1,17 @@
 # Copy this file to .env and fill in your values
 
+# Discord Bot Configuration
 DISCORD_TOKEN=your_bot_token_here
 GUILD_ID=your_server_id_here
+
+# Schedule Configuration (optional)
+EXPECTED_CHECKIN_TIME=09:00
+EXPECTED_CHECKOUT_TIME=18:00
+
+# Email Configuration (disabled for now - will be added back later)
+# SMTP_SERVER=smtp.gmail.com
+# SMTP_PORT=587
+# EMAIL_USER=your_email@gmail.com
+# EMAIL_PASSWORD=your_app_password
+# REPORT_EMAIL=your_email@gmail.com
 

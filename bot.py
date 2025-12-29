@@ -18,6 +18,10 @@ load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 GUILD_ID = int(os.getenv('GUILD_ID', 0))
 
+# Schedule configuration
+EXPECTED_CHECKIN_TIME = os.getenv('EXPECTED_CHECKIN_TIME', '09:00')
+EXPECTED_CHECKOUT_TIME = os.getenv('EXPECTED_CHECKOUT_TIME', '18:00')
+
 # Initialize bot with required intents
 intents = discord.Intents.default()
 intents.presences = True  # To track idle status
@@ -71,9 +75,18 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Error syncing commands: {e}")
     
-    # Start background task to check break timers (only if not already running)
+    # Start background tasks (only if not already running)
     if not check_breaks.is_running():
         check_breaks.start()
+    if not check_missing_checkins.is_running():
+        check_missing_checkins.start()
+    if not check_missing_checkouts.is_running():
+        check_missing_checkouts.start()
+    # Email report tasks removed for now
+    # if not send_weekly_report.is_running():
+    #     send_weekly_report.start()
+    # if not send_monthly_report.is_running():
+    #     send_monthly_report.start()
     
     print("🤖 Bot is ready!")
 
@@ -312,6 +325,8 @@ async def checkout(interaction: discord.Interaction):
         if result:
             total_hours = result['total_minutes'] / 60
             active_hours = result['active_minutes'] / 60
+            idle_hours = result.get('idle_minutes', 0) / 60
+            offline_hours = result.get('offline_minutes', 0) / 60
             break_hours = result['break_minutes'] / 60
             
             embed = discord.Embed(
@@ -328,6 +343,16 @@ async def checkout(interaction: discord.Interaction):
             embed.add_field(
                 name="💼 Active Time",
                 value=f"{active_hours:.2f} hours",
+                inline=True
+            )
+            embed.add_field(
+                name="🟡 Idle Time",
+                value=f"{idle_hours:.2f} hours",
+                inline=True
+            )
+            embed.add_field(
+                name="🔴 Offline Time",
+                value=f"{offline_hours:.2f} hours",
                 inline=True
             )
             embed.add_field(
@@ -485,9 +510,10 @@ async def mystats(interaction: discord.Interaction, days: int = 7):
         embed.set_thumbnail(url=user.display_avatar.url)
         
         # Summary at top
+        productivity = (stats['active_hours'] / stats['total_hours'] * 100) if stats['total_hours'] > 0 else 0
         embed.add_field(
             name="📈 Summary",
-            value=f"**Total:** {stats['total_hours']:.1f}h | **Active:** {stats['active_hours']:.1f}h | **Breaks:** {stats['break_hours']:.1f}h",
+            value=f"**Total:** {stats['total_hours']:.1f}h | **Active:** {stats['active_hours']:.1f}h | **Idle:** {stats['idle_hours']:.1f}h | **Offline:** {stats['offline_hours']:.1f}h | **Breaks:** {stats['break_hours']:.1f}h\n**Productivity:** {productivity:.1f}%",
             inline=False
         )
         
@@ -499,12 +525,14 @@ async def mystats(interaction: discord.Interaction, days: int = 7):
                 
                 total_h = day_data['total_hours']
                 active_h = day_data['active_hours']
+                idle_h = day_data.get('idle_hours', 0)
+                offline_h = day_data.get('offline_hours', 0)
                 break_h = day_data['break_hours']
                 shifts = day_data['shifts']
                 
                 value = f"⏱️ **{total_h:.2f}h** total\n"
-                value += f"💼 {active_h:.2f}h active | ☕ {break_h:.2f}h break\n"
-                value += f"📊 {shifts} shift(s)"
+                value += f"💼 {active_h:.2f}h active | 🟡 {idle_h:.2f}h idle | 🔴 {offline_h:.2f}h offline\n"
+                value += f"☕ {break_h:.2f}h break | 📊 {shifts} shift(s)"
                 
                 embed.add_field(
                     name=f"📅 {day_name}",
@@ -625,9 +653,10 @@ async def stats(interaction: discord.Interaction, user: discord.Member, days: in
         embed.set_thumbnail(url=user.display_avatar.url)
         
         # Summary at top
+        productivity = (overall_stats['active_hours'] / overall_stats['total_hours'] * 100) if overall_stats['total_hours'] > 0 else 0
         embed.add_field(
             name="📈 Summary",
-            value=f"**Total:** {overall_stats['total_hours']:.1f}h | **Active:** {overall_stats['active_hours']:.1f}h | **Breaks:** {overall_stats['break_hours']:.1f}h",
+            value=f"**Total:** {overall_stats['total_hours']:.1f}h | **Active:** {overall_stats['active_hours']:.1f}h | **Idle:** {overall_stats['idle_hours']:.1f}h | **Offline:** {overall_stats['offline_hours']:.1f}h | **Breaks:** {overall_stats['break_hours']:.1f}h\n**Productivity:** {productivity:.1f}%",
             inline=False
         )
         
@@ -639,12 +668,14 @@ async def stats(interaction: discord.Interaction, user: discord.Member, days: in
                 
                 total_h = day_data['total_hours']
                 active_h = day_data['active_hours']
+                idle_h = day_data.get('idle_hours', 0)
+                offline_h = day_data.get('offline_hours', 0)
                 break_h = day_data['break_hours']
                 shifts = day_data['shifts']
                 
                 value = f"⏱️ **{total_h:.2f}h** total\n"
-                value += f"💼 {active_h:.2f}h active | ☕ {break_h:.2f}h break\n"
-                value += f"📊 {shifts} shift(s)"
+                value += f"💼 {active_h:.2f}h active | 🟡 {idle_h:.2f}h idle | 🔴 {offline_h:.2f}h offline\n"
+                value += f"☕ {break_h:.2f}h break | 📊 {shifts} shift(s)"
                 
                 embed.add_field(
                     name=f"📅 {day_name}",
@@ -683,6 +714,250 @@ async def stats(interaction: discord.Interaction, user: discord.Member, days: in
             color=discord.Color.red()
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="summary", description="Get today's summary for all employees")
+async def daily_summary(interaction: discord.Interaction):
+    """Get daily summary of all employees"""
+    await interaction.response.defer()
+    
+    try:
+        today = datetime.datetime.now(PKT).date()
+        shifts = await tracker.get_all_active_shifts()
+        
+        # Get today's completed shifts - use weekly report data for today only
+        today = datetime.datetime.now(PKT).date()
+        data = await tracker.get_weekly_report_data(today, today)
+        completed_shifts = data.get('employees', [])
+        
+        embed = discord.Embed(
+            title=f"📊 Daily Summary - {today.strftime('%B %d, %Y')}",
+            description=f"**Active Shifts:** {len(shifts)} | **Completed Today:** {len(completed_shifts)}",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.now(PKT)
+        )
+        
+        # Show active employees
+        if shifts:
+            active_list = []
+            for shift in shifts[:10]:  # Limit to 10
+                hours = int(shift['duration'].total_seconds() // 3600)
+                minutes = int((shift['duration'].total_seconds() % 3600) // 60)
+                status_emoji = "🟢" if shift['status'] == 'online' else "🟡" if shift['status'] == 'idle' else "🔴"
+                active_list.append(f"{status_emoji} {shift['username']} - {hours}h {minutes}m")
+            embed.add_field(
+                name="🟢 Currently Working",
+                value="\n".join(active_list) if active_list else "None",
+                inline=False
+            )
+        
+        # Show top performers today
+        if completed_shifts:
+            top_performers = sorted(completed_shifts, key=lambda x: x['active_hours'], reverse=True)[:5]
+            top_list = []
+            for emp in top_performers:
+                top_list.append(f"💼 {emp['username']} - {emp['active_hours']:.1f}h active")
+            embed.add_field(
+                name="⭐ Top Performers Today",
+                value="\n".join(top_list),
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        print(f"Error in summary command: {e}")
+        embed = discord.Embed(
+            title="❌ Error",
+            description="An error occurred while generating summary.",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="leaderboard", description="View productivity leaderboard")
+@app_commands.describe(days="Number of days to look back (default: 7)")
+async def leaderboard(interaction: discord.Interaction, days: int = 7):
+    """View productivity leaderboard"""
+    await interaction.response.defer()
+    
+    try:
+        end_date = datetime.datetime.now(PKT).date()
+        start_date = end_date - datetime.timedelta(days=days-1)
+        
+        data = await tracker.get_weekly_report_data(start_date, end_date)
+        
+        if not data['employees']:
+            embed = discord.Embed(
+                title="📊 Leaderboard",
+                description="No data available for this period.",
+                color=discord.Color.gray()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        # Sort by productivity score
+        sorted_employees = sorted(data['employees'], key=lambda x: x['productivity_score'], reverse=True)
+        
+        embed = discord.Embed(
+            title=f"🏆 Productivity Leaderboard",
+            description=f"Last {days} days ({start_date} to {end_date})",
+            color=discord.Color.gold(),
+            timestamp=datetime.datetime.now(PKT)
+        )
+        
+        # Top 10
+        leaderboard_text = ""
+        medals = ["🥇", "🥈", "🥉"]
+        for i, emp in enumerate(sorted_employees[:10]):
+            medal = medals[i] if i < 3 else f"{i+1}."
+            score_emoji = "🟢" if emp['productivity_score'] >= 80 else "🟡" if emp['productivity_score'] >= 60 else "🔴"
+            leaderboard_text += f"{medal} {emp['username']} - {score_emoji} {emp['productivity_score']:.1f}% ({emp['active_hours']:.1f}h active)\n"
+        
+        embed.add_field(
+            name="Top Performers",
+            value=leaderboard_text,
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        print(f"Error in leaderboard command: {e}")
+        embed = discord.Embed(
+            title="❌ Error",
+            description="An error occurred while generating leaderboard.",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="productivity", description="View your productivity score")
+@app_commands.describe(days="Number of days to calculate (default: 7)")
+async def productivity(interaction: discord.Interaction, days: int = 7):
+    """View personal productivity score"""
+    await interaction.response.defer()
+    
+    user = interaction.user
+    
+    try:
+        stats = await tracker.get_user_stats(user.id, days)
+        
+        if stats['total_hours'] == 0:
+            embed = discord.Embed(
+                title="📊 Productivity Score",
+                description="No work data available for this period.",
+                color=discord.Color.gray()
+            )
+            await interaction.followup.send(embed=embed)
+            return
+        
+        productivity_score = (stats['active_hours'] / stats['total_hours'] * 100) if stats['total_hours'] > 0 else 0
+        
+        # Determine grade
+        if productivity_score >= 90:
+            grade = "🌟 Excellent"
+            color = discord.Color.green()
+        elif productivity_score >= 80:
+            grade = "✅ Great"
+            color = discord.Color.green()
+        elif productivity_score >= 70:
+            grade = "👍 Good"
+            color = discord.Color.blue()
+        elif productivity_score >= 60:
+            grade = "⚠️ Fair"
+            color = discord.Color.orange()
+        else:
+            grade = "❌ Needs Improvement"
+            color = discord.Color.red()
+        
+        embed = discord.Embed(
+            title=f"📊 Productivity Score - {user.display_name}",
+            description=f"**Score: {productivity_score:.1f}%** - {grade}",
+            color=color,
+            timestamp=datetime.datetime.now(PKT)
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+        
+        embed.add_field(
+            name="📈 Breakdown (Last {days} days)",
+            value=f"**Total Hours:** {stats['total_hours']:.1f}h\n"
+                  f"**Active:** {stats['active_hours']:.1f}h ({stats['active_hours']/stats['total_hours']*100:.1f}%)\n"
+                  f"**Idle:** {stats['idle_hours']:.1f}h ({stats['idle_hours']/stats['total_hours']*100:.1f}%)\n"
+                  f"**Offline:** {stats['offline_hours']:.1f}h ({stats['offline_hours']/stats['total_hours']*100:.1f}%)\n"
+                  f"**Breaks:** {stats['break_hours']:.1f}h",
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed)
+    except Exception as e:
+        print(f"Error in productivity command: {e}")
+        embed = discord.Embed(
+            title="❌ Error",
+            description="An error occurred while calculating productivity.",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+# Email functionality removed - will be added back later for testing
+# async def send_email_report(recipient: str, subject: str, html_content: str):
+#     """Send email report"""
+#     pass
+
+# # Email report generation functions removed - will be added back later
+# def generate_monthly_report_html(data: dict) -> str:
+
+@tasks.loop(time=datetime.time(hour=9, minute=0, tzinfo=PKT))
+async def check_missing_checkins():
+    """Check for employees who haven't checked in by expected time"""
+    try:
+        missing = await tracker.get_missing_checkins(EXPECTED_CHECKIN_TIME)
+        if missing:
+            guild = bot.get_guild(GUILD_ID)
+            if guild and guild.owner:
+                message = "🔔 **Missing Check-Ins Alert**\n\n"
+                for emp in missing:
+                    message += f"❌ {emp['username']} - Expected check-in: {emp['expected_time']}\n"
+                
+                embed = discord.Embed(
+                    title="⚠️ Missing Check-Ins",
+                    description=message,
+                    color=discord.Color.orange(),
+                    timestamp=datetime.datetime.now(PKT)
+                )
+                await guild.owner.send(embed=embed)
+                print(f"Alerted about {len(missing)} missing check-ins")
+    except Exception as e:
+        print(f"Error checking missing check-ins: {e}")
+
+@tasks.loop(time=datetime.time(hour=18, minute=0, tzinfo=PKT))
+async def check_missing_checkouts():
+    """Check for employees who forgot to check out"""
+    try:
+        missing = await tracker.get_missing_checkouts()
+        if missing:
+            guild = bot.get_guild(GUILD_ID)
+            if guild and guild.owner:
+                message = "🔔 **Missing Check-Outs Alert**\n\n"
+                for emp in missing:
+                    message += f"❌ {emp['username']} - Checked in {emp['hours_ago']:.1f} hours ago\n"
+                
+                embed = discord.Embed(
+                    title="⚠️ Missing Check-Outs",
+                    description=message,
+                    color=discord.Color.red(),
+                    timestamp=datetime.datetime.now(PKT)
+                )
+                await guild.owner.send(embed=embed)
+                print(f"Alerted about {len(missing)} missing check-outs")
+    except Exception as e:
+        print(f"Error checking missing check-outs: {e}")
+
+# Email report tasks removed - will be added back later for testing
+# @tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=PKT))
+# async def send_weekly_report():
+#     """Send weekly report every Monday"""
+#     pass
+
+# @tasks.loop(time=datetime.time(hour=8, minute=0, tzinfo=PKT))
+# async def send_monthly_report():
+#     """Send monthly report on the 1st of each month"""
+#     pass
 
 @tasks.loop(minutes=1)
 async def check_breaks():
